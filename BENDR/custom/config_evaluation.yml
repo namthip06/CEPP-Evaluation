@@ -1,0 +1,34 @@
+# Configuration for Sleep Staging Evaluation
+
+# Paths
+preprocessed_data_dir: /home/nummm/Documents/CEPP/BENDR/custom/preprocessing_output
+encoder_weights: /home/nummm/Documents/CEPP/BENDR/weights/encoder.pt
+context_weights: /home/nummm/Documents/CEPP/BENDR/weights/contextualizer.pt
+output_dir: /home/nummm/Documents/CEPP/BENDR/custom/evaluation_results
+
+# Model parameters (matching BENDR pre-training)
+num_classes: 5
+encoder_h: 512
+contextualizer_hidden: 3076
+
+# Data parameters
+sfreq: 256  # Sampling frequency (Hz)
+tlen: 30    # Epoch length (seconds)
+batch_size: 1  # Process one epoch at a time for low RAM
+
+# Sleep stage mapping
+sleep_stages:
+  0: Wake
+  1: N1
+  2: N2
+  3: N3
+  4: REM
+
+# Stage name to integer mapping (for annotations)
+stage_to_int:
+  'Sleep stage W': 0
+  'Sleep stage 1': 1
+  'Sleep stage 2': 2
+  'Sleep stage 3': 3
+  'Sleep stage 4': 3  # Map N4 to N3
+  'Sleep stage R': 4
