@@ -24,8 +24,9 @@ from datetime import datetime, timedelta
 import traceback
 
 # Add parent directory to path to import preprocessing module
-sys.path.append("..")
-sys.path.append("../sleepfm")
+root_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+sys.path.append(root_path)
+sys.path.append(os.path.join(root_path, "sleepfm"))
 from preprocessing.preprocessing import EDFToHDF5Converter
 
 

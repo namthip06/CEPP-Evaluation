@@ -6,7 +6,7 @@ This folder contains the custom scripts for the SleepFM clinical pipeline. The p
 
 The pipeline consists of 4 main steps:
 
-```mermaid
+```
 graph TD
     A[Raw Data (EDF)] -->|1. Preprocess| B(HDF5 + Labels)
     B -->|2. Generate Embeddings| C(Embeddings)
