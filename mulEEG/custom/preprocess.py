@@ -1,327 +1,407 @@
 #!/usr/bin/env python
 # coding: utf-8
-
 """
-Custom EDF/CSV Preprocessing Script for mulEEG
-Based on SHHS preprocessing logic
+SHHS EEG Preprocessing Pipeline
+================================
+Reads raw EEG recordings from the rawEEG directory structure, processes each
+subject's EDF + hypnogram CSV, and saves cleaned .npz files ready for model
+training.
 
-Converts EDF signals and CSV hypnogram data into mulEEG-compatible .npz format
+Directory layout expected under BASE_DIR:
+  <subject_id>/
+    ├── edf_signals.edf
+    ├── csv_hypnogram.csv
+    └── csv_events.csv   (optional – not used here)
 
-Folder structure expected:
-    /home/nummm/Documents/CEPP/rawEEG/[id]/
-        csv_events.csv
-        csv_hypnogram.csv
-        edf_signals.edf
-
-Output saved to:
-    custom/preprocessing_output/[id]/[id].npz
+Output layout under OUTPUT_BASE_DIR:
+  <subject_id>.npz   →  keys: x (epochs), y (labels), fs (sampling rate),
+                                source_edf, source_csv
 """
 
-import numpy as np
 import os
+from typing import List, Optional
+import sys
+import logging
+import datetime
+import numpy as np
 import pandas as pd
+from pathlib import Path
+from tqdm import tqdm
 from mne.io import read_raw_edf
+import mne
 
-
-# ==================== PATHS (absolute) ====================
-# Base directory of this script (mulEEG/custom/)
-_SCRIPT_DIR = os.path.abspath(os.path.dirname(__file__))
-
-# Input: rawEEG folder (sibling of mulEEG)
-BASE_DIR = os.path.abspath(os.path.join(_SCRIPT_DIR, '..', '..', 'rawEEG'))
-
-# Output: custom/preprocessing_output inside mulEEG
+# ─────────────────────────────────────────────────────────────────────────────
+# PATHS  (absolute)
+# ─────────────────────────────────────────────────────────────────────────────
+_SCRIPT_DIR     = os.path.abspath(os.path.dirname(__file__))
+BASE_DIR        = os.path.abspath(os.path.join(_SCRIPT_DIR, '..', '..', 'rawEEG'))
 OUTPUT_BASE_DIR = os.path.abspath(os.path.join(_SCRIPT_DIR, 'preprocessing_output'))
-# ==========================================================
 
+# ─────────────────────────────────────────────────────────────────────────────
+# HYPER-PARAMETERS
+# ─────────────────────────────────────────────────────────────────────────────
+TARGET_SFREQ   = 100          # Hz  – downsample target
+EPOCH_SEC      = 30           # seconds per epoch
+SAMPLES_EPOCH  = TARGET_SFREQ * EPOCH_SEC   # 3 000 samples per epoch
+MIN_DURATION_MIN = 60         # skip recordings shorter than this (minutes)
+EEG_CHANNEL    = 'EEG C4-A1' # primary channel name to look for
 
-def parse_hypnogram_csv(csv_path, epoch_sec_size=30):
+# Sleep-stage mapping: CSV label string → integer class
+STAGE_MAP = {
+    'WK':  0, 'W':   0,
+    'N1':  1, 'S1':  1,
+    'N2':  2, 'S2':  2,
+    'N3':  3, 'S3':  3, 'S4': 3, 'N4': 3,
+    'REM': 4, 'R':   4,
+}
+UNKNOWN_LABEL = -1   # used when a stage string is not in STAGE_MAP
+
+# ─────────────────────────────────────────────────────────────────────────────
+# LOGGING SETUP
+# ─────────────────────────────────────────────────────────────────────────────
+os.makedirs(OUTPUT_BASE_DIR, exist_ok=True)
+
+_log_ts   = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+_log_file = os.path.join(OUTPUT_BASE_DIR, f'preprocess_{_log_ts}.log')
+
+logging.basicConfig(
+    level=logging.DEBUG,
+    format='%(asctime)s [%(levelname)s] %(message)s',
+    datefmt='%H:%M:%S',
+    handlers=[
+        logging.FileHandler(_log_file, encoding='utf-8'),
+        logging.StreamHandler(sys.stdout),
+    ]
+)
+log = logging.getLogger(__name__)
+
+# Silence MNE's verbose output so our own logs stay readable
+mne.set_log_level('WARNING')
+
+# ─────────────────────────────────────────────────────────────────────────────
+# HELPER FUNCTIONS
+# ─────────────────────────────────────────────────────────────────────────────
+
+def find_eeg_channel(ch_names: List[str], preferred: str = EEG_CHANNEL) -> Optional[str]:
     """
-    Parse hypnogram CSV file and convert sleep stages to numeric labels.
-
-    Args:
-        csv_path: Path to CSV file containing sleep stage labels
-        epoch_sec_size: Duration of each epoch in seconds (default: 30)
-
-    Returns:
-        labels: numpy array of numeric sleep stage labels (0-4)
-
-    Label mapping:
-        0: Wake  (WK)
-        1: N1
-        2: N2
-        3: N3 / N4
-        4: REM
-
-    Raises:
-        ValueError: If an unknown sleep stage label is encountered
+    Return the channel name that best matches *preferred*.
+    Falls back to any channel starting with 'EEG C4' if an exact match fails.
+    Returns None if nothing is found.
     """
-    # Read CSV – strip leading/trailing whitespace from column names
-    df = pd.read_csv(csv_path)
-    df.columns = df.columns.str.strip()
+    # Exact match
+    if preferred in ch_names:
+        log.debug(f"  Found exact channel '{preferred}'")
+        return preferred
 
-    # Locate the sleep stage column
+    # Case-insensitive exact match
+    for ch in ch_names:
+        if ch.strip().upper() == preferred.upper():
+            log.debug(f"  Found case-insensitive channel '{ch}'")
+            return ch
+
+    # Partial match on the first part (e.g. 'EEG C4')
+    prefix = preferred.split('-')[0].strip().upper()
+    candidates = [ch for ch in ch_names if ch.strip().upper().startswith(prefix)]
+    if candidates:
+        log.debug(f"  Partial match – using '{candidates[0]}' (candidates: {candidates})")
+        return candidates[0]
+
+    log.warning(f"  Channel '{preferred}' NOT found. Available: {ch_names}")
+    return None
+
+
+def read_hypnogram(csv_path: str) -> Optional[np.ndarray]:
+    """
+    Read the hypnogram CSV and return an integer label array.
+    Expects a column named 'stage' (case-insensitive) or uses the first column.
+    """
+    try:
+        df = pd.read_csv(csv_path)
+    except Exception as e:
+        log.error(f"  Cannot read hypnogram CSV: {e}")
+        return None
+
+    # Find the stage column
     stage_col = None
-    possible_cols = ['Sleep Stage', 'stage', 'label', 'hypnogram', 'annotation', 'event']
-    for col in possible_cols:
-        if col in df.columns:
+    for col in df.columns:
+        if col.strip().lower() == 'sleep stage':
             stage_col = col
             break
-
     if stage_col is None:
         stage_col = df.columns[0]
-        print(f"  Warning: No standard stage column found, using first column '{stage_col}'")
+        log.debug(f"  No 'stage' column found; using first column '{stage_col}'")
 
-    print(f"  Using column '{stage_col}' for sleep stages")
-
-    stages = df[stage_col].values
-
-    # Convert to numeric labels
+    raw_stages = df[stage_col].astype(str).str.strip().tolist()
     labels = []
-    for stage in stages:
-        stage_str = str(stage).strip().upper()
+    unknown_set = set()
 
-        if stage_str in ['W', 'WK', 'WAKE', '0']:
-            labels.append(0)
-        elif stage_str in ['N1', '1', 'S1']:
-            labels.append(1)
-        elif stage_str in ['N2', '2', 'S2']:
-            labels.append(2)
-        elif stage_str in ['N3', 'N4', '3', '4', 'S3', 'S4']:
-            labels.append(3)
-        elif stage_str in ['REM', 'R', '5']:
-            labels.append(4)
+    for s in raw_stages:
+        mapped = STAGE_MAP.get(s, STAGE_MAP.get(s.upper(), None))
+        if mapped is None:
+            unknown_set.add(s)
+            labels.append(UNKNOWN_LABEL)
         else:
-            raise ValueError(
-                f"Unknown sleep stage label '{stage}' in {csv_path}. "
-                f"Expected one of: WK, N1, N2, N3, N4, REM (and numeric equivalents)."
-            )
+            labels.append(mapped)
+
+    if unknown_set:
+        log.critical(
+            f"  Unknown stage label(s) encountered: {unknown_set}. "
+            f"Mapped to UNKNOWN_LABEL ({UNKNOWN_LABEL})."
+        )
 
     return np.array(labels, dtype=np.int32)
 
 
-def preprocess_edf_csv(edf_path, hypnogram_path, output_path,
-                       select_channel=None, trim_wake_edges=True,
-                       edge_minutes=30, epoch_sec_size=30):
+# ─────────────────────────────────────────────────────────────────────────────
+# MAIN PROCESSING FUNCTION
+# ─────────────────────────────────────────────────────────────────────────────
+
+def process_subject(subject_dir: str) -> dict:
     """
-    Preprocess EDF and CSV files into mulEEG-compatible .npz format.
-
-    Args:
-        edf_path: Path to EDF file
-        hypnogram_path: Path to CSV hypnogram file
-        output_path: Path to save output .npz file
-        select_channel: Specific EEG channel to extract (None = auto-select first EEG)
-        trim_wake_edges: Whether to trim wake periods at edges
-        edge_minutes: Minutes to extend before/after sleep period
-        epoch_sec_size: Epoch duration in seconds
+    Process one subject folder.  Returns a result dict with fields:
+        subject, status, n_epochs, reason
     """
-    print(f"  EDF:       {edf_path}")
-    print(f"  Hypnogram: {hypnogram_path}")
+    subject_id = os.path.basename(subject_dir)
+    result = dict(subject=subject_id, status='ERROR', n_epochs=0, reason='')
 
-    # ── Read EDF (no preload yet – memory optimisation) ──────────────────────
-    raw = read_raw_edf(edf_path, preload=False, stim_channel=None, verbose=False)
-    print(f"  Sampling rate: {raw.info['sfreq']} Hz")
-    print(f"  Channels ({len(raw.ch_names)}): {raw.ch_names}")
+    edf_path = os.path.join(subject_dir, 'edf_signals.edf')
+    csv_path = os.path.join(subject_dir, 'csv_hypnogram.csv')
 
-    # ── Channel selection ─────────────────────────────────────────────────────
-    if select_channel is None:
-        eeg_channels = [ch for ch in raw.ch_names if 'EEG' in ch.upper()]
-        if eeg_channels:
-            select_channel = eeg_channels[0]
-            print(f"  Auto-selected EEG channel: {select_channel}")
-        else:
-            select_channel = raw.ch_names[0]
-            print(f"  Warning: No EEG channel found, using first channel: {select_channel}")
-    else:
-        print(f"  Using specified channel: {select_channel}")
+    # ── 1. File presence check ────────────────────────────────────────────────
+    missing = [f for f in [edf_path, csv_path] if not os.path.isfile(f)]
+    if missing:
+        msg = f"Missing file(s): {[os.path.basename(m) for m in missing]}. Skipping."
+        log.error(f"[{subject_id}] {msg}")
+        result['reason'] = msg
+        return result
 
-    # Pick only the needed channel BEFORE loading data (saves RAM)
-    raw.pick_channels([select_channel])
-    raw.load_data()
+    log.info(f"[{subject_id}] ─── Starting ───────────────────────────────────")
 
-    # ── Resample to 100 Hz if needed ──────────────────────────────────────────
-    original_sfreq = raw.info['sfreq']
-    target_sfreq = 100.0
-    if original_sfreq != target_sfreq:
-        print(f"  Resampling {original_sfreq} Hz → {target_sfreq} Hz …")
-        raw.resample(target_sfreq, npad='auto', verbose=False)
-    else:
-        print(f"  Sampling rate already {target_sfreq} Hz, no resampling needed")
+    # ── 2. EDF header integrity & sampling rate ───────────────────────────────
+    try:
+        raw = read_raw_edf(edf_path, preload=False, stim_channel=None, verbose=False)
+    except Exception as e:
+        msg = f"Failed to open EDF: {e}"
+        log.error(f"[{subject_id}] {msg}")
+        result['reason'] = msg
+        return result
 
-    sampling_rate = raw.info['sfreq']
+    orig_sfreq = raw.info['sfreq']
+    ch_names   = raw.info['ch_names']
+    n_times    = raw.n_times
+    duration_s = n_times / orig_sfreq
+    duration_min = duration_s / 60.0
 
-    # Get raw signal (shape: [n_samples])
-    raw_ch = raw.get_data()[0]
-    print(f"  Signal samples: {len(raw_ch)}")
-
-    # ── Parse hypnogram ───────────────────────────────────────────────────────
-    labels = parse_hypnogram_csv(hypnogram_path, epoch_sec_size)
-    print(f"  Labels: {len(labels)}")
-
-    # ── Align signal length with labels ───────────────────────────────────────
-    samples_per_epoch = int(epoch_sec_size * sampling_rate)
-    expected_samples = len(labels) * samples_per_epoch
-
-    if len(raw_ch) != expected_samples:
-        print(f"  Warning: Signal length ({len(raw_ch)}) ≠ expected ({expected_samples})")
-        if len(raw_ch) > expected_samples:
-            print(f"  Trimming signal to {expected_samples} samples")
-            raw_ch = raw_ch[:expected_samples]
-        else:
-            print(f"  Padding signal to {expected_samples} samples")
-            raw_ch = np.pad(raw_ch, (0, expected_samples - len(raw_ch)), mode='constant')
-
-    # ── Split into epochs ─────────────────────────────────────────────────────
-    n_epochs = len(labels)
-    x = raw_ch.reshape(n_epochs, samples_per_epoch).astype(np.float32)
-    y = labels.astype(np.int32)
-
-    print(f"  Epochs shape: {x.shape}")
-    dist = {0: 'WK', 1: 'N1', 2: 'N2', 3: 'N3', 4: 'REM'}
-    print("  Label distribution: " + ", ".join(
-        f"{dist[k]}={np.sum(y == k)}" for k in range(5)))
-
-    # ── Trim wake edges (SHHS-style) ──────────────────────────────────────────
-    if trim_wake_edges:
-        nw_idx = np.where(y != 0)[0]
-        if len(nw_idx) > 0:
-            start_idx = max(0, nw_idx[0] - (edge_minutes * 2))
-            end_idx = min(len(y) - 1, nw_idx[-1] + (edge_minutes * 2))
-            select_idx = np.arange(start_idx, end_idx + 1)
-            print(f"  Before trim: {x.shape}")
-            x = x[select_idx]
-            y = y[select_idx]
-            print(f"  After  trim: {x.shape}")
-        else:
-            print("  Warning: No non-wake epochs found; skipping trim")
-
-    # ── Save ──────────────────────────────────────────────────────────────────
-    np.savez(output_path, x=x, y=y, fs=sampling_rate)
-    print(f"  Saved → {output_path}")
-
-
-def main():
-    # ==================== CONFIGURATION ====================
-    # Input directory (rawEEG)
-    input_base_dir = BASE_DIR
-
-    # Output directory (custom/preprocessing_output)
-    output_base_dir = OUTPUT_BASE_DIR
-
-    # Channel selection (None = auto-select first EEG channel)
-    # Example: "EEG C4-A1"
-    select_channel = None
-
-    # Wake-edge trimming
-    trim_wake_edges = True
-    edge_minutes = 30
-
-    # Epoch size (seconds)
-    epoch_sec_size = 30
-    # =======================================================
-
-    print("=" * 70)
-    print("EDF/CSV Batch Preprocessing for mulEEG")
-    print("=" * 70)
-    print(f"Input  directory : {input_base_dir}")
-    print(f"Output directory : {output_base_dir}")
-    print("=" * 70)
-
-    # Validate input directory
-    if not os.path.exists(input_base_dir):
-        print(f"ERROR: Input directory does not exist: {input_base_dir}")
-        return
-
-    # Create output base directory
-    os.makedirs(output_base_dir, exist_ok=True)
-
-    # Collect and sort patient folders
-    patient_folders = sorted(
-        f for f in os.listdir(input_base_dir)
-        if os.path.isdir(os.path.join(input_base_dir, f))
+    log.info(
+        f"[{subject_id}] Original SFreq: {orig_sfreq:.1f} Hz | "
+        f"Channels: {len(ch_names)} | Duration: {duration_min:.1f} min"
     )
-    print(f"\nFound {len(patient_folders)} patient folder(s)\n")
 
-    processed_count = 0
-    skipped_no_edf = 0
-    skipped_done = 0
-    error_count = 0
+    # ── 3. Duration filter ─────────────────────────────────────────────────────
+    if duration_min < MIN_DURATION_MIN:
+        msg = (
+            f"Duration {duration_min:.1f} min < {MIN_DURATION_MIN} min threshold. "
+            "Recording too short for sleep-architecture learning. Skipping."
+        )
+        log.warning(f"[{subject_id}] {msg}")
+        result['reason'] = msg
+        return result
 
-    for patient_id in patient_folders:
-        patient_input_dir = os.path.join(input_base_dir, patient_id)
-        patient_output_dir = os.path.join(output_base_dir, patient_id)
-        output_file = os.path.join(patient_output_dir, f"{patient_id}.npz")
+    # ── 4. Channel selection ──────────────────────────────────────────────────
+    ch = find_eeg_channel(ch_names, preferred=EEG_CHANNEL)
+    if ch is None:
+        msg = f"Required channel '{EEG_CHANNEL}' not found. Skipping."
+        log.error(f"[{subject_id}] {msg}")
+        result['reason'] = msg
+        return result
 
-        print(f"{'=' * 70}")
-        print(f"Patient: {patient_id}")
+    ch_idx = ch_names.index(ch)
+    log.debug(f"[{subject_id}] Using channel '{ch}' at index {ch_idx}")
 
-        # Skip if already processed
-        if os.path.exists(output_file):
-            print(f"  ⊘ Already processed – skipping")
-            skipped_done += 1
-            continue
-
-        # Required files
-        edf_file = os.path.join(patient_input_dir, "edf_signals.edf")
-        hypnogram_file = os.path.join(patient_input_dir, "csv_hypnogram.csv")
-
-        # Skip if EDF missing
-        if not os.path.exists(edf_file):
-            print(f"  ⊘ edf_signals.edf not found – skipping")
-            skipped_no_edf += 1
-            continue
-
-        # Error if hypnogram missing
-        if not os.path.exists(hypnogram_file):
-            print(f"  ✗ csv_hypnogram.csv not found – skipping with error")
-            error_count += 1
-            continue
-
-        # Create output directory
-        os.makedirs(patient_output_dir, exist_ok=True)
-
-        try:
-            preprocess_edf_csv(
-                edf_path=edf_file,
-                hypnogram_path=hypnogram_file,
-                output_path=output_file,
-                select_channel=select_channel,
-                trim_wake_edges=trim_wake_edges,
-                edge_minutes=edge_minutes,
-                epoch_sec_size=epoch_sec_size,
+    # ── 5. Load & resample ────────────────────────────────────────────────────
+    try:
+        raw.load_data()
+        raw.pick([ch])
+        if orig_sfreq != TARGET_SFREQ:
+            log.info(
+                f"[{subject_id}] Resampling {orig_sfreq:.1f} Hz → {TARGET_SFREQ} Hz …"
             )
-            processed_count += 1
-            print(f"  ✓ Done")
+            raw.resample(TARGET_SFREQ, npad='auto')
+        signal = raw.get_data()[0]   # shape: (n_samples,)
+    except Exception as e:
+        msg = f"Signal loading/resampling failed: {e}"
+        log.error(f"[{subject_id}] {msg}")
+        result['reason'] = msg
+        return result
 
-        except ValueError as ve:
-            # Label mapping error – raised intentionally
-            print(f"  ✗ Label error: {ve}")
-            error_count += 1
-            # Clean up partial output
-            if os.path.exists(patient_output_dir):
-                import shutil
-                shutil.rmtree(patient_output_dir)
+    log.debug(f"[{subject_id}] Signal shape after resample: {signal.shape}")
 
-        except Exception as e:
-            print(f"  ✗ Unexpected error: {e}")
-            error_count += 1
-            if os.path.exists(patient_output_dir):
-                import shutil
-                shutil.rmtree(patient_output_dir)
+    # ── 6. Epoch divisibility check & trim ────────────────────────────────────
+    remainder = len(signal) % SAMPLES_EPOCH
+    if remainder != 0:
+        trimmed = len(signal) - remainder
+        log.warning(
+            f"[{subject_id}] Signal length {len(signal)} not divisible by "
+            f"{SAMPLES_EPOCH} ({EPOCH_SEC}s × {TARGET_SFREQ}Hz). "
+            f"Trimming {remainder} trailing samples → {trimmed} samples."
+        )
+        signal = signal[:trimmed]
 
-    # Summary
-    print("\n" + "=" * 70)
-    print("PROCESSING SUMMARY")
-    print("=" * 70)
-    print(f"Total patient folders : {len(patient_folders)}")
-    print(f"Successfully processed: {processed_count}")
-    print(f"Skipped (no EDF)      : {skipped_no_edf}")
-    print(f"Skipped (already done): {skipped_done}")
-    print(f"Errors                : {error_count}")
-    print("=" * 70)
+    n_epochs_from_edf = len(signal) // SAMPLES_EPOCH
+    log.info(f"[{subject_id}] EDF epochs: {n_epochs_from_edf}")
+
+    # ── 7. Read hypnogram labels ──────────────────────────────────────────────
+    labels = read_hypnogram(csv_path)
+    if labels is None:
+        msg = "Hypnogram read failed. Skipping."
+        log.error(f"[{subject_id}] {msg}")
+        result['reason'] = msg
+        return result
+
+    n_epochs_from_csv = len(labels)
+    log.info(f"[{subject_id}] CSV rows (epochs): {n_epochs_from_csv}")
+
+    # ── 8. Label / epoch count synchronisation ────────────────────────────────
+    if n_epochs_from_edf != n_epochs_from_csv:
+        log.warning(
+            f"[{subject_id}] Mismatch! EDF: {n_epochs_from_edf} epochs, "
+            f"CSV: {n_epochs_from_csv} rows. Adjusting to min …"
+        )
+        n_use = min(n_epochs_from_edf, n_epochs_from_csv)
+        signal = signal[: n_use * SAMPLES_EPOCH]
+        labels = labels[:n_use]
+        log.info(f"[{subject_id}] Aligned to {n_use} epochs.")
+    else:
+        n_use = n_epochs_from_edf
+
+    # ── 9. Reject UNKNOWN labels ──────────────────────────────────────────────
+    if np.any(labels == UNKNOWN_LABEL):
+        n_bad = np.sum(labels == UNKNOWN_LABEL)
+        log.warning(
+            f"[{subject_id}] {n_bad} epoch(s) have UNKNOWN_LABEL ({UNKNOWN_LABEL}). "
+            "They will be kept in the file but should be filtered during training."
+        )
+
+    # ── 10. Shape into epochs ─────────────────────────────────────────────────
+    x = signal.reshape(n_use, SAMPLES_EPOCH).astype(np.float32)   # (n_epochs, 3000)
+    y = labels.astype(np.int32)                                    # (n_epochs,)
+    assert x.shape[0] == y.shape[0], "Shape mismatch after alignment!"
+
+    log.debug(f"[{subject_id}] x.shape={x.shape}, y.shape={y.shape}")
+
+    # ── 11. Save .npz with audit metadata ─────────────────────────────────────
+    out_filename = f"{subject_id}.npz"
+    out_path     = os.path.join(OUTPUT_BASE_DIR, out_filename)
+
+    np.savez(
+        out_path,
+        x          = x,
+        y          = y,
+        fs         = np.float32(TARGET_SFREQ),
+        source_edf = np.bytes_(os.path.abspath(edf_path)),
+        source_csv = np.bytes_(os.path.abspath(csv_path)),
+    )
+    log.info(f"[{subject_id}] ✓ Saved → {out_path}")
+
+    result.update(status='OK', n_epochs=n_use, reason='')
+    return result
 
 
-if __name__ == "__main__":
-    seed = 123
-    np.random.seed(seed)
-    main()
+# ─────────────────────────────────────────────────────────────────────────────
+# PIPELINE ENTRY POINT
+# ─────────────────────────────────────────────────────────────────────────────
+
+def run_pipeline():
+    log.info("=" * 70)
+    log.info("SHHS EEG PREPROCESSING PIPELINE")
+    log.info(f"  BASE_DIR        : {BASE_DIR}")
+    log.info(f"  OUTPUT_BASE_DIR : {OUTPUT_BASE_DIR}")
+    log.info(f"  TARGET_SFREQ    : {TARGET_SFREQ} Hz")
+    log.info(f"  EPOCH_SEC       : {EPOCH_SEC} s  ({SAMPLES_EPOCH} samples/epoch)")
+    log.info(f"  MIN_DURATION    : {MIN_DURATION_MIN} min")
+    log.info(f"  EEG_CHANNEL     : {EEG_CHANNEL}")
+    log.info("=" * 70)
+
+    os.makedirs(OUTPUT_BASE_DIR, exist_ok=True)
+
+    # Collect subject directories
+    if not os.path.isdir(BASE_DIR):
+        log.error(f"BASE_DIR does not exist: {BASE_DIR}")
+        sys.exit(1)
+
+    subject_dirs = sorted([
+        os.path.join(BASE_DIR, d)
+        for d in os.listdir(BASE_DIR)
+        if os.path.isdir(os.path.join(BASE_DIR, d))
+    ])
+
+    log.info(f"Found {len(subject_dirs)} subject folder(s) in BASE_DIR.")
+
+    # ── Iterate over subjects ─────────────────────────────────────────────────
+    summary_rows = []
+
+    for subject_dir in tqdm(subject_dirs, desc='Processing subjects', unit='subj'):
+        # Skip if already done
+        subject_id = os.path.basename(subject_dir)
+        out_path   = os.path.join(OUTPUT_BASE_DIR, f"{subject_id}.npz")
+        if os.path.isfile(out_path):
+            log.info(f"[{subject_id}] Already processed. Skipping.")
+            summary_rows.append(
+                dict(subject=subject_id, status='SKIPPED', n_epochs='-', reason='already exists')
+            )
+            continue
+
+        row = process_subject(subject_dir)
+        summary_rows.append(row)
+
+    # ── Summary table ─────────────────────────────────────────────────────────
+    log.info("")
+    log.info("=" * 70)
+    log.info("PIPELINE SUMMARY")
+    log.info("=" * 70)
+
+    df_summary = pd.DataFrame(summary_rows)
+
+    # Print aligned table to log
+    col_widths = {
+        'subject':  30,
+        'status':   10,
+        'n_epochs': 9,
+        'reason':   45,
+    }
+    header = (
+        f"{'Subject':<{col_widths['subject']}}"
+        f"{'Status':<{col_widths['status']}}"
+        f"{'Epochs':>{col_widths['n_epochs']}}"
+        f"  {'Reason'}"
+    )
+    log.info(header)
+    log.info("-" * 100)
+
+    for _, row in df_summary.iterrows():
+        line = (
+            f"{str(row['subject']):<{col_widths['subject']}}"
+            f"{str(row['status']):<{col_widths['status']}}"
+            f"{str(row['n_epochs']):>{col_widths['n_epochs']}}"
+            f"  {str(row['reason'])}"
+        )
+        log.info(line)
+
+    log.info("-" * 100)
+    counts = df_summary['status'].value_counts().to_dict()
+    log.info(
+        f"TOTAL: {len(df_summary)} | "
+        + " | ".join(f"{k}: {v}" for k, v in sorted(counts.items()))
+    )
+    log.info(f"Log saved to: {_log_file}")
+
+    # Save CSV summary alongside the output files
+    summary_csv = os.path.join(OUTPUT_BASE_DIR, f'summary_{_log_ts}.csv')
+    df_summary.to_csv(summary_csv, index=False)
+    log.info(f"Summary CSV saved to: {summary_csv}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+if __name__ == '__main__':
+    np.random.seed(42)
+    run_pipeline()

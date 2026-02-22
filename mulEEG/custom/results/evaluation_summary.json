@@ -1,0 +1,10 @@
+{
+  "run_timestamp": "20260223_010435",
+  "checkpoint": "/home/nummm/Documents/CEPP/mulEEG/weights/shhs/ours_diverse.pt",
+  "preprocessing_dir": "/home/nummm/Documents/CEPP/mulEEG/custom/preprocessing_output",
+  "n_subjects_total": 41,
+  "n_subjects_ok": 0,
+  "n_epochs_total": 0,
+  "overall_metrics": {},
+  "per_subject": []
+}

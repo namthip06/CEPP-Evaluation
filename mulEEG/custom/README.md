@@ -1,107 +1,40 @@
-# mulEEG Custom Pipeline Guide
+# Execution Failure Summary: RTX 4050 & Weight Mismatch
 
-This guide explains how to preprocess raw continuous EEG data and evaluate it using the pre-trained **mulEEG** model.
+The failure to generate valid predictions stems from two distinct layers of the system: the **Instruction Layer (CUDA)** and the **Decision Layer (Model Weights)**.
 
-The workflow consists of two main steps:
-1.  **Preprocessing**: Converting raw EDF/CSV files into model-ready `.npz` files.
-2.  **Evaluation**: Running the model on the processed data and analyzing performance.
+## 1. Hardware Level: CUDA Kernel Mismatch (Cause & Effect)
 
----
+**The Cause:**
+Your hardware (NVIDIA RTX 4050) belongs to the **Ada Lovelace** architecture, which requires **Compute Capability 8.9 (sm_89)**. However, the legacy PyTorch version in your Python 3.7 environment was built for older GPUs (Kepler/Turing), supporting only up to **sm_75**.
 
-## 1. Prerequisites & Folder Structure
-
-To run the pipeline, ensure your directories are structured as follows:
-
-```text
-/Documents/CEPP/
-├── mulEEG/                  <-- Project Root
-│   └── custom/
-│       ├── preprocess.py    <-- Script 1: Preprocessing
-│       └── evaluate.py      <-- Script 2: Evaluation
-└── rawEEG/                  <-- Input Data (Sibling of mulEEG)
-    ├── [patient_id_1]/
-    │   ├── edf_signals.edf      <-- Required: Raw Signals
-    │   └── csv_hypnogram.csv    <-- Required: Sleep Stages
-    └── [patient_id_2]/
-        ...
-```
-
-> **Note**: The `rawEEG` folder must be located one level up from `mulEEG/custom/`, alongside the `mulEEG` folder itself.
+**The Effect:**
+Even though the system "sees" the GPU, it cannot talk to it. When the code attempts to run a calculation, it searches for a "Kernel Image" (the binary translation for sm_89) inside the PyTorch library. Since that image doesn't exist, the execution crashes with a `RuntimeError`.
 
 ---
 
-## 2. Step 1: Preprocessing (`preprocess.py`)
+## 2. Model Level: Missing Classifier Weights (Cause & Effect)
 
-This script reads raw EDF files and CSV hypnograms, standardizes them, and saves them as `.npz` files.
+Even if you bypass the CUDA error by using the CPU, you encountered a critical warning regarding the weights in `ours_diverse.pt`.
 
-### What it does:
-*   Reads EDF signals and downsamples to 100 Hz.
-*   Maps sleep stages (WK, N1, N2, N3, REM) to numeric labels (0-4).
-*   Segments data into 30-second epochs.
-*   Trims excessive wake periods from the start and end.
+**The Cause:**
+The warning `Available checkpoint keys: ['eeg_model_state_dict']` indicates that the file you are loading contains **only the Encoder weights** (the part that understands EEG patterns) but **not the Linear Layer weights** (the part that maps those patterns to specific sleep stages like W, N1, N2, etc.).
 
-### How to Run:
-Open your terminal and run:
+**The Effect:**
+Since the "Decision Layer" (Linear Layer) is missing from the file:
 
-```bash
-cd /home/nummm/Documents/CEPP/mulEEG/custom
-python preprocess.py
-```
-
-### Configuration:
-You can adjust settings directly in `preprocess.py` (inside the `main()` function):
-*   `select_channel`: Specific EEG channel to use (default: `None` = auto-select).
-*   `trim_wake_edges`: Set to `True` to remove long wake periods at the start/end.
-*   `epoch_sec_size`: Duration of each epoch (default: `30` seconds).
-
-### Output:
-Processed files are saved to `mulEEG/custom/preprocessing_output/`.
+1. **Random Initialization:** PyTorch creates a brand-new, untrained linear layer with random numbers.
+2. **Biased/Random Predictions:** The model is effectively "guessing" the sleep stages. While the "brain" (Encoder) sees the EEG features correctly, the "voice" (Linear Layer) hasn't been taught which feature corresponds to which label.
+3. **Invalid Output:** Any CSV results generated under this state are scientifically invalid and likely show a single repeated stage or random noise.
 
 ---
 
-## 3. Step 2: Evaluation (`evaluate.py`)
+## Final Conclusion
 
-This script loads the preprocessed data, runs the pre-trained model, and calculates performance metrics.
+| Issue Level | Error/Warning | Outcome |
+| --- | --- | --- |
+| **Hardware** | `no kernel image available` | Execution **STOPS** (Crash) unless switched to CPU. |
+| **Software** | `Linear layer weights not found` | Execution **CONTINUES** but results are **USELESS** (Random). |
 
-### What it does:
-*   Loads the pre-trained model (`weights/shhs/ours_diverse.pt`).
-*   Runs inference on each patient's data (CPU-optimized for low RAM).
-*   Generates accuracy, F1-scores, and confusion matrices.
+### Why `ours_diverse.pt` gave this result:
 
-### How to Run:
-Once preprocessing is complete, run:
-
-```bash
-cd /home/nummm/Documents/CEPP/mulEEG/custom
-python evaluate.py
-```
-
-### Configuration:
-Settings in `evaluate.py`:
-*   `checkpoint_path`: Path to model weights.
-*   `device`: Set to `"cpu"` by default for stability.
-
----
-
-## 4. Understanding the Results
-
-After running `evaluate.py`, check the `mulEEG/custom/results/` folder for:
-
-1.  **`evaluation_summary.txt`**:
-    *   **Overall Metrics**: Accuracy, Macro F1, Kappa across all patients.
-    *   **Per-Class Performance**: Precision/Recall for Wake, N1, N2, N3, REM.
-    *   **Patient Stats**: Min/Max/Mean accuracy per patient.
-
-2.  **`per_patient_results.csv`**:
-    *   Detailed metrics for *each* individual patient. Use this to identify outliers or specific patients where the model underperforms.
-
-3.  **`confusion_matrix.png`**:
-    *   Visualizes where the model makes mistakes (e.g., confusing N1 with Wake).
-
----
-
-### Troubleshooting
-
-*   **"Input directory does not exist"**: Ensure `rawEEG` is in the correct location (see Section 1).
-*   **"Checkpoint not found"**: Verify you have `weights/shhs/ours_diverse.pt`.
-*   **"Memory Error"**: The scripts are optimized for CPU, but ensure you have at least 4-8GB RAM available.
+In the original **mulEEG** repository, `ours_diverse.pt` often refers to the **Self-Supervised Pre-trained weights**. These weights are meant to be a starting point for fine-tuning, not for immediate prediction.
