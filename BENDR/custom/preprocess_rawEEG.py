@@ -1,315 +1,333 @@
 #!/usr/bin/env python3
 """
 Preprocessing script for rawEEG data
-Processes data from /home/nummm/Documents/CEPP/rawEEG/[id]/ folders
-Outputs to custom/preprocessing_output
+Compliant with data.md specification.
 
-Folder structure:
+Execution:
+    uv run preprocess_rawEEG.py
+
+Folder structure expected at BASE_DIR:
     rawEEG/
-    ├── [id]/
-    │   ├── csv_events.csv
-    │   ├── csv_hypnogram.csv
-    │   └── edf_signals.edf
+    └── [id]/
+        ├── edf_signals.edf       (REQUIRED)
+        ├── csv_hypnogram.csv     (REQUIRED)
+        └── csv_events.csv        (OPTIONAL)
 
-Output: preprocessed FIF files with annotations
+Output: preprocessing_output/<id>_preprocessed.fif
 """
 
 import os
 import sys
+import traceback
+
 import mne
-import pandas as pd
 import numpy as np
-from pathlib import Path
-from datetime import datetime, timedelta
+import pandas as pd
 
-# Suppress MNE logging
-mne.set_log_level('WARNING')
+# ─── Suppress MNE noise ───────────────────────────────────────────────────────
+mne.set_log_level("WARNING")
 
-# Define absolute paths
-BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
-RAW_EEG_DIR = '/home/nummm/Documents/CEPP/rawEEG'
-OUTPUT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), 'preprocessing_output'))
+# ─── Path Management (data.md §2 — Strict Rule) ──────────────────────────────
+_SCRIPT_DIR = os.path.abspath(os.path.dirname(__file__))
+BASE_DIR = os.path.abspath(os.path.join(_SCRIPT_DIR, "..", "..", "rawEEG"))
+OUTPUT_DIR = os.path.join(_SCRIPT_DIR, "preprocessing_output")
+
+# ─── Pre-Processing Guardrail constants (data.md §4) ─────────────────────────
+MIN_DURATION_HOURS = 1.5  # Skip if recording < 6 h
+NS_SKIP_THRESHOLD = 0.50  # Skip if NS epochs > 50 % of total epochs
+EPOCH_DURATION_S = 30.0  # Fixed epoch length (data.md §5.2)
+TARGET_SFREQ = 256  # BENDR standard sampling rate
+BAD_CH_THRESHOLD = 5  # Bad channel: std > N × median or < median / N
 
 
-def parse_hypnogram(csv_path):
+# ═══════════════════════════════════════════════════════════════════════════════
+# HELPER: Hypnogram parser
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# Label map — data.md §5.2 (case-insensitive)
+_STAGE_MAP = {
+    "W": "Sleep stage W",
+    "WK": "Sleep stage W",
+    "WAKE": "Sleep stage W",
+    "N1": "Sleep stage 1",
+    "1": "Sleep stage 1",
+    "N2": "Sleep stage 2",
+    "2": "Sleep stage 2",
+    "N3": "Sleep stage 3",
+    "3": "Sleep stage 3",
+    "N4": "Sleep stage 4",
+    "4": "Sleep stage 4",
+    "REM": "Sleep stage R",
+    "R": "Sleep stage R",
+}
+
+
+def parse_hypnogram(csv_path: str):
     """
-    Parse hypnogram CSV file and create MNE annotations
-    
-    Parameters:
-    -----------
-    csv_path : str
-        Path to csv_hypnogram.csv
-    
-    Returns:
-    --------
-    annotations : mne.Annotations
-        Annotations object with sleep stages
+    Parse csv_hypnogram.csv → mne.Annotations.
+    Returns (annotations, ns_fraction) or (None, None) on failure.
+    ns_fraction = fraction of epochs labelled NS (Non-Scored).
     """
     try:
-        # Read CSV file
         df = pd.read_csv(csv_path)
-        
-        # Clean column names (remove spaces)
         df.columns = df.columns.str.strip()
-        
-        # Expected columns: 'Epoch Number', 'Start Time', 'Sleep Stage'
-        # Handle variations in column names
-        epoch_col = None
-        time_col = None
-        stage_col = None
-        
+
+        # Locate required columns (data.md §5.2)
+        epoch_col = stage_col = time_col = None
         for col in df.columns:
-            col_lower = col.lower()
-            if 'epoch' in col_lower:
+            c = col.lower()
+            if "epoch" in c:
                 epoch_col = col
-            elif 'time' in col_lower:
-                time_col = col
-            elif 'stage' in col_lower:
+            elif "stage" in c:
                 stage_col = col
-        
-        if not all([epoch_col, time_col, stage_col]):
-            print(f"  Warning: Could not find required columns in {csv_path}")
-            print(f"  Available columns: {df.columns.tolist()}")
-            return None
-        
-        # Parse data
-        onsets = []
-        durations = []
-        descriptions = []
-        
-        # Assume 30-second epochs (standard for sleep staging)
-        epoch_duration = 30.0
-        
+            elif "time" in c:
+                time_col = col
+
+        if not all([epoch_col, stage_col]):
+            print(f"  ⚠ Cannot find required columns in {os.path.basename(csv_path)}")
+            print(f"    Available: {df.columns.tolist()}")
+            return None, None
+
+        total_epochs = len(df)
+        ns_count = 0
+        onsets, durations, descriptions = [], [], []
+
         for idx, row in df.iterrows():
-            onset = idx * epoch_duration  # Start time in seconds from beginning
-            duration = epoch_duration
-            
-            # Map sleep stage to standard format
             stage = str(row[stage_col]).strip().upper()
-            
-            # Standardize sleep stage names
-            stage_mapping = {
-                'WK': 'Sleep stage W',
-                'W': 'Sleep stage W',
-                'WAKE': 'Sleep stage W',
-                'N1': 'Sleep stage 1',
-                '1': 'Sleep stage 1',
-                'N2': 'Sleep stage 2',
-                '2': 'Sleep stage 2',
-                'N3': 'Sleep stage 3',
-                '3': 'Sleep stage 3',
-                'N4': 'Sleep stage 4',
-                '4': 'Sleep stage 4',
-                'REM': 'Sleep stage R',
-                'R': 'Sleep stage R',
-            }
-            
-            description = stage_mapping.get(stage, f'Sleep stage {stage}')
-            
-            onsets.append(onset)
-            durations.append(duration)
-            descriptions.append(description)
-        
-        # Create annotations
-        annotations = mne.Annotations(onset=onsets, 
-                                      duration=durations, 
-                                      description=descriptions)
-        
-        print(f"  Parsed {len(annotations)} sleep stage annotations")
-        return annotations
-        
+
+            # Count NS epochs for guardrail
+            if stage in ("NS", "?", "UNKNOWN", ""):
+                ns_count += 1
+
+            desc = _STAGE_MAP.get(stage, f"Sleep stage {stage}")
+            onsets.append(idx * EPOCH_DURATION_S)
+            durations.append(EPOCH_DURATION_S)
+            descriptions.append(desc)
+
+        ns_fraction = ns_count / total_epochs if total_epochs > 0 else 0.0
+        annotations = mne.Annotations(
+            onset=onsets, duration=durations, description=descriptions
+        )
+
+        print(
+            f"  Hypnogram: {total_epochs} epochs  |  NS = "
+            f"{ns_count} ({ns_fraction:.1%})"
+        )
+        return annotations, ns_fraction
+
     except Exception as e:
-        print(f"  Error parsing hypnogram: {e}")
-        return None
+        print(f"  ✗ Error parsing hypnogram: {e}")
+        return None, None
 
 
-def preprocess_single_subject(subject_id, raw_dir, output_dir):
+# ═══════════════════════════════════════════════════════════════════════════════
+# CORE: Preprocess one subject
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+def preprocess_single_subject(subject_id: str, raw_dir: str, output_dir: str) -> str:
     """
-    Preprocess a single subject's EEG data
-    
-    Parameters:
-    -----------
-    subject_id : str
-        Subject ID (folder name)
-    raw_dir : str
-        Path to rawEEG directory
-    output_dir : str
-        Path to output directory
-    
-    Returns:
-    --------
-    success : bool
-        True if processing was successful
+    Process one subject.
+
+    Returns
+    -------
+    'ok'      — processed successfully
+    'skip'    — skipped due to guardrail
+    'error'   — unexpected failure
     """
     subject_path = os.path.join(raw_dir, subject_id)
-    
-    # Define file paths
-    edf_path = os.path.join(subject_path, 'edf_signals.edf')
-    hypnogram_path = os.path.join(subject_path, 'csv_hypnogram.csv')
-    events_path = os.path.join(subject_path, 'csv_events.csv')
-    
-    # Check if EDF file exists
+    edf_path = os.path.join(subject_path, "edf_signals.edf")
+    hypno_path = os.path.join(subject_path, "csv_hypnogram.csv")
+    events_path = os.path.join(subject_path, "csv_events.csv")
+
+    # ── Guardrail 1: Missing files (data.md §4) ─────────────────────────────
+    missing = []
     if not os.path.exists(edf_path):
-        print(f"  Skipping {subject_id}: edf_signals.edf not found")
-        return False
-    
-    print(f"\nProcessing subject: {subject_id}")
-    print(f"  EDF file: {edf_path}")
-    
+        missing.append("edf_signals.edf")
+    if not os.path.exists(hypno_path):
+        missing.append("csv_hypnogram.csv")
+    if missing:
+        print(f"  ⏭ SKIP — missing: {', '.join(missing)}")
+        return "skip"
+
     try:
-        # 1. Read EDF file
-        print("  Loading EDF file...")
-        raw = mne.io.read_raw_edf(edf_path, preload=True, verbose=False)
-        print(f"  Original sampling rate: {raw.info['sfreq']} Hz")
-        print(f"  Duration: {raw.times[-1]:.1f} seconds ({raw.times[-1]/60:.1f} minutes)")
-        print(f"  Channels: {len(raw.ch_names)}")
-        
-        # 2. Pick only EEG channels
+        # ── Step 1: Inspect EDF (no preload yet) ───────────────────────────
+        print(f"  Loading EDF header …")
+        raw = mne.io.read_raw_edf(edf_path, preload=False, verbose=False)
+
+        sfreq = raw.info["sfreq"]
+        duration = raw.times[-1]  # seconds
+        n_ch_raw = len(raw.ch_names)
+
+        print(f"  sfreq       : {sfreq} Hz")
+        print(f"  Duration    : {duration:.1f} s  ({duration / 3600:.2f} h)")
+        print(f"  Raw channels: {n_ch_raw}")
+
+        # Show every channel name from file (user request: "show Channels from file")
+        print(f"  Channel list ({n_ch_raw} total):")
+        for i, ch in enumerate(raw.ch_names, 1):
+            print(f"    [{i:>3}] {ch}")
+
+        # ── Guardrail 2: Duration < 6 hours (data.md §4) ───────────────────
+        if duration < MIN_DURATION_HOURS * 3600:
+            print(
+                f"  ⏭ SKIP — duration {duration / 3600:.2f} h < {MIN_DURATION_HOURS} h"
+            )
+            del raw
+            return "skip"
+
+        # ── Guardrail 3: NS epochs > 50 % (data.md §4) ─────────────────────
+        print(f"  Parsing hypnogram …")
+        annotations, ns_fraction = parse_hypnogram(hypno_path)
+        if annotations is None:
+            print("  ⏭ SKIP — could not parse hypnogram")
+            del raw
+            return "skip"
+        if ns_fraction > NS_SKIP_THRESHOLD:
+            print(f"  ⏭ SKIP — NS fraction {ns_fraction:.1%} > {NS_SKIP_THRESHOLD:.0%}")
+            del raw
+            return "skip"
+
+        # ── Step 2: Preload data for processing ────────────────────────────
+        print(f"  Preloading data into RAM …")
+        raw.load_data(verbose=False)
+
+        # ── Step 3: Pick EEG channels only (data.md §5.1) ─────────────────
         try:
-            raw.pick_types(eeg=True, exclude='bads')
-            print(f"  Selected {len(raw.ch_names)} EEG channels")
+            raw.pick_types(eeg=True, exclude="bads")
+            eeg_ch = raw.ch_names
+            print(f"  EEG channels selected: {len(eeg_ch)}")
+            print(f"  EEG channel names: {eeg_ch}")
         except Exception as e:
-            print(f"  Warning: Could not pick EEG channels automatically: {e}")
-            print(f"  Using all channels")
-        
-        # 3. Apply filters (band-pass 0.5-40 Hz, notch 50/60 Hz)
-        print("  Applying filters...")
+            print(f"  ⚠ pick_types failed ({e}) — keeping all channels")
+
+        # ── Step 4: Band-pass + notch filter ───────────────────────────────
+        print(f"  Filtering (0.5–40 Hz, notch 50/60 Hz) …")
         try:
-            raw.filter(l_freq=0.5, h_freq=40.0, fir_design='firwin', verbose=False)
+            raw.filter(l_freq=0.5, h_freq=40.0, fir_design="firwin", verbose=False)
             raw.notch_filter(freqs=[50, 60], verbose=False)
         except Exception as e:
-            print(f"  Warning: Filtering failed: {e}")
-        
-        # 4. Resample to 256 Hz (BENDR standard)
-        target_sfreq = 256
-        if raw.info['sfreq'] != target_sfreq:
-            print(f"  Resampling to {target_sfreq} Hz...")
-            raw.resample(target_sfreq, verbose=False)
-        
-        # 5. Check and fix bad channels
-        print("  Checking for bad channels...")
+            print(f"  ⚠ Filtering error: {e}")
+
+        # ── Step 5: Resample to 256 Hz ─────────────────────────────────────
+        if raw.info["sfreq"] != TARGET_SFREQ:
+            print(f"  Resampling {raw.info['sfreq']} → {TARGET_SFREQ} Hz …")
+            raw.resample(TARGET_SFREQ, verbose=False)
+        else:
+            print(f"  Sampling rate already {TARGET_SFREQ} Hz — no resample needed")
+
+        # ── Step 6: Bad channel detection & interpolation ──────────────────
+        print(f"  Checking for bad channels …")
         try:
             data = raw.get_data()
-            channel_stds = np.std(data, axis=1)
-            median_std = np.median(channel_stds)
-            bad_threshold = 5  # 5x median
-            
-            bad_channels = []
-            for i, std in enumerate(channel_stds):
-                if std > bad_threshold * median_std or std < median_std / bad_threshold:
-                    bad_channels.append(raw.ch_names[i])
-            
-            if bad_channels:
-                print(f"  Found bad channels: {bad_channels}")
-                raw.info['bads'] = bad_channels
+            ch_stds = np.std(data, axis=1)
+            med_std = np.median(ch_stds)
+            bad_ch = [
+                raw.ch_names[i]
+                for i, s in enumerate(ch_stds)
+                if s > BAD_CH_THRESHOLD * med_std or s < med_std / BAD_CH_THRESHOLD
+            ]
+            if bad_ch:
+                print(f"  Bad channels found: {bad_ch}")
+                raw.info["bads"] = bad_ch
                 raw.interpolate_bads(reset_bads=True, verbose=False)
+                print(f"  Interpolated {len(bad_ch)} bad channel(s)")
             else:
                 print("  No bad channels detected")
+            del data
         except Exception as e:
-            print(f"  Warning: Bad channel detection failed: {e}")
-        
-        # 6. Parse and add hypnogram annotations
-        if os.path.exists(hypnogram_path):
-            print("  Parsing hypnogram...")
-            annotations = parse_hypnogram(hypnogram_path)
-            if annotations is not None:
-                raw.set_annotations(annotations)
-                print("  Added sleep stage annotations")
-        else:
-            print(f"  Warning: Hypnogram file not found: {hypnogram_path}")
-        
-        # 7. Save preprocessed data
-        output_file = os.path.join(output_dir, f'{subject_id}_preprocessed.fif')
-        print(f"  Saving to: {output_file}")
+            print(f"  ⚠ Bad channel detection failed: {e}")
+
+        # ── Step 7: Attach hypnogram annotations ───────────────────────────
+        raw.set_annotations(annotations)
+        print(f"  Annotations attached ({len(annotations)} epochs)")
+
+        # ── Step 8: Optional events CSV (data.md §5.3) ─────────────────────
+        if os.path.exists(events_path):
+            print(f"  Events file found: {os.path.basename(events_path)} (not applied)")
+
+        # ── Step 9: Save FIF (data.md §6 — Absolute Paths) ─────────────────
+        output_file = os.path.join(output_dir, f"{subject_id}_preprocessed.fif")
+        print(f"  Saving → {output_file}")
         raw.save(output_file, overwrite=True, verbose=False)
-        
-        # Clean up to free memory
+
+        # ── Clean up (data.md §6 — Memory Efficiency) ──────────────────────
         del raw
-        del data
-        
-        print(f"  ✓ Successfully processed {subject_id}")
-        return True
-        
+        print(f"  ✓ Done: {subject_id}")
+        return "ok"
+
     except Exception as e:
-        print(f"  ✗ Error processing {subject_id}: {e}")
-        import traceback
+        print(f"  ✗ Unexpected error: {e}")
         traceback.print_exc()
-        return False
+        return "error"
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# ENTRY POINT
+# ═══════════════════════════════════════════════════════════════════════════════
 
 
 def main():
-    """
-    Main function to process all subjects in rawEEG directory
-    """
-    print("="*70)
-    print("RawEEG Preprocessing Script")
-    print("="*70)
-    print(f"Input directory: {RAW_EEG_DIR}")
-    print(f"Output directory: {OUTPUT_DIR}")
-    print("="*70)
-    
+    print("=" * 70)
+    print("RawEEG Preprocessing Pipeline  (data.md compliant)")
+    print("=" * 70)
+    print(f"Script dir  : {_SCRIPT_DIR}")
+    print(f"Input  dir  : {BASE_DIR}")
+    print(f"Output dir  : {OUTPUT_DIR}")
+    print(f"Min duration: {MIN_DURATION_HOURS} h")
+    print(f"NS threshold: {NS_SKIP_THRESHOLD:.0%}")
+    print("=" * 70)
+
+    # Validate input directory
+    if not os.path.isdir(BASE_DIR):
+        print(f"\n✗ rawEEG directory not found: {BASE_DIR}")
+        sys.exit(1)
+
     # Create output directory
     os.makedirs(OUTPUT_DIR, exist_ok=True)
-    print(f"\nOutput directory created: {OUTPUT_DIR}")
-    
-    # Check if rawEEG directory exists
-    if not os.path.exists(RAW_EEG_DIR):
-        print(f"\nError: rawEEG directory not found: {RAW_EEG_DIR}")
-        sys.exit(1)
-    
-    # Get list of subject IDs (folder names)
+
+    # Discover subject folders
     try:
-        all_items = os.listdir(RAW_EEG_DIR)
-        subject_ids = [item for item in all_items 
-                      if os.path.isdir(os.path.join(RAW_EEG_DIR, item))]
-        subject_ids.sort()  # Sort for consistent processing order
+        subject_ids = sorted(
+            item
+            for item in os.listdir(BASE_DIR)
+            if os.path.isdir(os.path.join(BASE_DIR, item))
+        )
     except Exception as e:
-        print(f"\nError reading rawEEG directory: {e}")
+        print(f"\n✗ Cannot list {BASE_DIR}: {e}")
         sys.exit(1)
-    
-    print(f"\nFound {len(subject_ids)} subject folders")
-    
-    if len(subject_ids) == 0:
-        print("No subject folders found!")
+
+    print(f"\nFound {len(subject_ids)} subject folder(s)\n")
+    if not subject_ids:
+        print("No subjects found — exiting.")
         sys.exit(1)
-    
-    # Process each subject sequentially (no batch/parallel processing)
-    success_count = 0
-    skip_count = 0
-    error_count = 0
-    
-    for i, subject_id in enumerate(subject_ids, 1):
-        print(f"\n{'='*70}")
-        print(f"Progress: {i}/{len(subject_ids)}")
-        print(f"{'='*70}")
-        
-        result = preprocess_single_subject(subject_id, RAW_EEG_DIR, OUTPUT_DIR)
-        
-        if result:
-            success_count += 1
-        elif result is False:
-            # Check if it was skipped or error
-            edf_path = os.path.join(RAW_EEG_DIR, subject_id, 'edf_signals.edf')
-            if not os.path.exists(edf_path):
-                skip_count += 1
-            else:
-                error_count += 1
-    
-    # Print summary
-    print("\n" + "="*70)
+
+    # ── Main loop: Load → Process → Save → Clear (data.md §6) ────────────────
+    counts = {"ok": 0, "skip": 0, "error": 0}
+
+    for idx, subject_id in enumerate(subject_ids, 1):
+        print(f"\n{'=' * 70}")
+        print(f"[{idx}/{len(subject_ids)}]  Subject: {subject_id}")
+        print("=" * 70)
+
+        result = preprocess_single_subject(subject_id, BASE_DIR, OUTPUT_DIR)
+        counts[result] += 1  # data.md §6 — error handling continues loop
+
+    # ── Summary (data.md §6) ──────────────────────────────────────────────────
+    print("\n" + "=" * 70)
     print("PROCESSING COMPLETE")
-    print("="*70)
-    print(f"Total subjects: {len(subject_ids)}")
-    print(f"Successfully processed: {success_count}")
-    print(f"Skipped (no EDF): {skip_count}")
-    print(f"Errors: {error_count}")
-    print("="*70)
-    print(f"\nPreprocessed files saved to: {OUTPUT_DIR}")
-    
-    # List output files
-    output_files = [f for f in os.listdir(OUTPUT_DIR) if f.endswith('.fif')]
-    print(f"Total output files: {len(output_files)}")
+    print("=" * 70)
+    print(f"  Total subjects : {len(subject_ids)}")
+    print(f"  Successfully processed : {counts['ok']}")
+    print(f"  Skipped (guardrails)   : {counts['skip']}")
+    print(f"  Errors                 : {counts['error']}")
+    print("=" * 70)
+
+    output_files = [f for f in os.listdir(OUTPUT_DIR) if f.endswith(".fif")]
+    print(f"\nOutput files in {OUTPUT_DIR}: {len(output_files)}")
+    for f in sorted(output_files):
+        print(f"  • {f}")
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
